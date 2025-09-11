@@ -1,0 +1,2 @@
+run:
+	aws-sso.py
