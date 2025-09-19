@@ -1,9 +1,12 @@
 #!/usr/bin/python3
+import re
 import sys
 import json
 import time
 import os
 import pathlib
+import subprocess
+import socket
 import configparser
 import urllib.request
 import urllib.error
@@ -11,6 +14,17 @@ import datetime as dt
 from typing import Any
 
 assert sys.version.startswith('3.9.')
+
+HOST = '0.0.0.0'
+# HOST = '127.0.0.1'
+PORT = 4550
+PID = os.getpid()
+
+PING = b'PING\n'
+PONG = b'PONG\n'
+STOP = b'STOP\n'
+BYE = b'BYE!\n'
+GET_SSO = b'GET SSO\n'
 
 
 def error(msg: str) -> None:
@@ -147,5 +161,172 @@ def main() -> None:
     raise error('Timed out waiting for authorization.')
 
 
+def lsof(port):
+    if isinstance(port, int) or isinstance(port, str) and port.isdigit():
+        port = f':{port}'
+    if _ := subprocess.run(f'lsof -nPi {port}'.split(), capture_output=True).stdout:
+        h, *lines = _.decode().splitlines()
+        h = h.lower().split()
+        return [
+            dict(zip(h, re.split(r'\s+', _, maxsplit=len(h))))
+            for _ in lines
+        ]
+    return None
+
+
+def verify_client(addr):
+    client, server = None, None
+    if addr[0] != '127.0.0.1':
+        return print('Invalid address:', addr)
+    if len(procs := lsof(port=f'TCP:{addr[1]}')) != 2:
+        return print('Unexpected procs:', procs)
+    for p in procs:
+        n = p['name'].split('->')
+        if len(n) == 2:
+            f, t = n
+            if f == f'127.0.0.1:{PORT}':
+                server = p
+            elif t == f'127.0.0.1:{PORT}':
+                client = p
+            else:
+                return print('Invalid process:', p)
+    if not client or client['command'] != 'Python':
+        return print('Invalid client:', client)
+    if not server or server['command'] != 'Python':
+        return print('Invalid server:', server)
+    if int(server['pid']) != PID:
+        # TODO: react on server swap
+        # os.system(f'ps -p {p["pid"]} -o lstart=')
+        return print('Invalid server pid:', server['pid'])
+    if client['user'] != server['user']:
+        return print('Invalid client user:', client['user'])
+    return True
+
+
+def serve():
+    sso_token = None
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        # Allow reusing the address after the process exits
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((HOST, PORT))
+        except Exception as e:
+            if 'Address already in use' in str(e):
+                # TODO: force kill?
+                exit()
+            raise
+        s.listen()
+
+        print(f"Server listening on {HOST}:{PORT}...")
+        while True:
+            c, addr = s.accept()
+            with c:
+                if verify_client(addr):
+                    print(f"Connected by {addr}")
+                else:
+                    print(f"Rejected {addr}")
+                    continue
+
+                f = c.makefile('rb')  # line-buffered view over the socket
+                try:
+                    for line in f:
+                        if line == PING:
+                            c.sendall(PONG)
+                        elif line == STOP:
+                            c.sendall(BYE)
+                            exit()
+                        elif line == GET_SSO:
+                            if sso_token:
+                                c.sendall(sso_token)
+                            else:
+                                c.sendall(b'\n')
+                        elif line.startswith(b"PUT SSO "):
+                            c.sendall(b'')
+                        elif line.startswith(b"PUT ROLE "):
+                            c.sendall(b'')
+                        elif line.startswith(b"GET ROLE "):
+                            c.sendall(b'')
+                except ConnectionResetError as e:
+                    print(e)
+
+
+def request(cmd):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect((HOST, PORT))
+
+    if isinstance(cmd, str):
+        cmd = cmd.encode()
+    cmd = cmd.strip() + b'\n'
+
+    print("-->", cmd.strip().decode())
+    s.sendall(cmd)
+    r = s.recv(1024)
+    print("<--", r.decode().strip() or '(none)')
+
+    s.close()
+    return r
+
+
+def start():
+    subprocess.Popen(
+        sys.argv[:1] + ['start'],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        preexec_fn=os.setsid,  # start in a new session
+    )
+    time.sleep(0.1)
+    return ping()
+
+
+def stop():
+    return request(STOP) == BYE
+
+
+def ping():
+    return request(PING) == PONG
+
+
+def get_server():
+    return [p for p in lsof(port=f'TCP:{PORT}') or [] if p['name'] == f'*:{PORT}']
+
+
+def is_running():
+    return bool(get_server())
+
+
 if __name__ == '__main__':
-    main()
+    assert (_ := sys.version_info) > (3, 9), _
+    print('pid', my_pid := os.getpid())
+    print('args', args := sys.argv[1:])
+    print('proc', get_server())
+
+    if args == ['start']:
+        serve() and exit()
+
+    elif args == ['stop']:
+        if stop():
+            exit()
+        else:
+            raise error('Failed to stop server.')
+
+    started = False
+    if not is_running():
+        started = start()
+        if not started:
+            raise error('Failed to start server.')
+
+    _ = request(GET_SSO)
+    print(_)
+
+    # stop()
+
+    # while True:
+    #     with pathlib.Path('/tmp/aws-sso.log').open('a+') as fp:
+    #         fp.write(f'{dt.datetime.now().isoformat()}\n')
+    #     time.sleep(1)
+
+    # while True:
+    #     time.sleep(1)
+    #     print(pathlib.Path('/tmp/aws-sso.log').read_text())
+
+    # main()
