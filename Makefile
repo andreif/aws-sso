@@ -4,10 +4,10 @@ clean:
 	rm -f ${path}
 
 run: ${path}
-	aws-sso
+	aws-sso.py
 
 serve: ${path}
-	aws-sso start
+	aws-sso.py serve
 
 ${path}:
 	ln -sf $$(realpath aws-sso.py) ${path}
