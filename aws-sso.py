@@ -1,7 +1,9 @@
 #!/usr/bin/python3
 import re
+import signal
 import sys
 import json
+import threading
 import time
 import os
 import pathlib
@@ -19,12 +21,17 @@ HOST = '0.0.0.0'
 # HOST = '127.0.0.1'
 PORT = 4550
 PID = os.getpid()
+LOCK = threading.Lock()
+SSO_TOKEN: bytes | None = None
+OIDC_URL = 'https://oidc.{}.amazonaws.com'
 
 PING = b'PING\n'
 PONG = b'PONG\n'
 STOP = b'STOP\n'
 BYE = b'BYE!\n'
 GET_SSO = b'GET SSO\n'
+PUT_SSO = b'PUT SSO '
+OK = b'OK!\n'
 
 
 def error(msg: str) -> None:
@@ -92,13 +99,13 @@ def post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError(f'HTTP {e.code} POST {url}: {body}')
 
 
-def main() -> None:
+def sso_auth():
     sess = load_sso_session()
     region = sess['region']
     start_url = sess['start_url']
     scopes: list[str] = sess['scopes']
 
-    base = f'https://oidc.{region}.amazonaws.com'
+    base = OIDC_URL.format(region)
 
     reg = post_json(f'{base}/client/register', {
         'clientName': 'aws-sso-' + sess['alias'],
@@ -145,20 +152,25 @@ def main() -> None:
             # Other HTTP errors
             raise error(msg)
         else:
-            out = {
-                'accessToken': tok['accessToken'],
-                'tokenType': tok.get('tokenType', 'Bearer'),
-                'expiresIn': tok.get('expiresIn'),
-                'refreshToken': tok.get('refreshToken'),
-                'issuedAt': dt.datetime.now(tz=dt.timezone.utc).isoformat(),
+            print('tok', tok)
+            t = dt.datetime.now(tz=dt.timezone.utc)
+            return {
+                **tok,
+                'issuedAt': t.isoformat(),
+                'expiresAt': (t + dt.timedelta(seconds=tok['expiresIn'])).isoformat(),
                 'region': region,
                 'startUrl': start_url,
                 'scopes': scopes,
+                'clientId': client_id,
+                'clientSecret': client_secret,
+                # 'deviceCode': dev['deviceCode'],
             }
-            print(json.dumps(out, indent=2))
-            return
 
     raise error('Timed out waiting for authorization.')
+
+
+def now():
+    return dt.datetime.now(tz=dt.timezone.utc)
 
 
 def lsof(port):
@@ -204,50 +216,102 @@ def verify_client(addr):
 
 
 def serve():
-    sso_token = None
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        # Allow reusing the address after the process exits
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            s.bind((HOST, PORT))
-        except Exception as e:
-            if 'Address already in use' in str(e):
-                # TODO: force kill?
-                exit()
-            raise
-        s.listen()
+    global SSO_TOKEN
+    stop_event = threading.Event()
 
-        print(f"Server listening on {HOST}:{PORT}...")
-        while True:
-            c, addr = s.accept()
-            with c:
-                if verify_client(addr):
-                    print(f"Connected by {addr}")
-                else:
-                    print(f"Rejected {addr}")
-                    continue
+    def _shutdown(*_):
+        stop_event.set()
 
-                f = c.makefile('rb')  # line-buffered view over the socket
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    def _refresher() -> None:
+        global SSO_TOKEN
+        while not stop_event.is_set():
+            if SSO_TOKEN:
+                session = json.loads(SSO_TOKEN)
+                d = now() - dt.datetime.fromisoformat(session['issuedAt'])
+                if d > dt.timedelta(seconds=session['expiresIn']):
+                    SSO_TOKEN = None
+                elif d > dt.timedelta(minutes=10):
+                    base = OIDC_URL.format(session['region'])
+                    tok = post_json(f'{base}/token', {
+                        'grantType': 'refresh_token',
+                        'clientId': session['clientId'],
+                        'clientSecret': session['clientSecret'],
+                        'refreshToken': session['refreshToken'],
+                    })
+                    print('ref', tok)
+                    _ = now().isoformat()
+                    SSO_TOKEN = json.dumps({**session, **tok, 'issuedAt': _}).encode()
+                    assert request(PUT_SSO + json.dumps(session).encode() + b'\n') == OK
+
+                    ...
+
+            time.sleep(60)
+
+    thread = threading.Thread(target=_refresher, daemon=True)
+    thread.start()
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            # Allow reusing the address after the process exits
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind((HOST, PORT))
+            except Exception as e:
+                if 'Address already in use' in str(e):
+                    # TODO: force kill the other hanging process if needed?
+                    exit()
+                raise
+            s.listen()
+            s.settimeout(0.5)  # allow responsive shutdown
+
+            print(f"Server listening on {HOST}:{PORT}...")
+            while not stop_event.is_set():
                 try:
-                    for line in f:
-                        if line == PING:
-                            c.sendall(PONG)
-                        elif line == STOP:
-                            c.sendall(BYE)
-                            exit()
-                        elif line == GET_SSO:
-                            if sso_token:
-                                c.sendall(sso_token)
-                            else:
-                                c.sendall(b'\n')
-                        elif line.startswith(b"PUT SSO "):
-                            c.sendall(b'')
-                        elif line.startswith(b"PUT ROLE "):
-                            c.sendall(b'')
-                        elif line.startswith(b"GET ROLE "):
-                            c.sendall(b'')
-                except ConnectionResetError as e:
-                    print(e)
+                    c, addr = s.accept()
+                except TimeoutError:
+                    continue
+                except OSError as e:
+                    if e.errno == 11:  # EAGAIN on some platforms
+                        continue
+                    raise
+                with c:
+                    if verify_client(addr):
+                        print(f"Connected by {addr}")
+                    else:
+                        print(f"Rejected {addr}")
+                        continue
+
+                    f = c.makefile('rb')  # line-buffered view over the socket
+                    try:
+                        for line in f:
+                            print(line.split()[:2])
+                            if line == PING:
+                                c.sendall(PONG)
+                            elif line == STOP:
+                                c.sendall(BYE)
+                                exit()
+                            elif line == GET_SSO:
+                                with LOCK:
+                                    if sso_token:
+                                        c.sendall(sso_token)
+                                    else:
+                                        c.sendall(b'\n')
+                            elif line.startswith(PUT_SSO):
+                                with LOCK:
+                                    sso_token = line[len(PUT_SSO):]
+                                c.sendall(OK)
+                            elif line.startswith(b"PUT ROLE "):
+                                c.sendall(b'')
+                            elif line.startswith(b"GET ROLE "):
+                                c.sendall(b'')
+                    except ConnectionResetError as e:
+                        print(e)
+    finally:
+        stop_event.set()
+        thread.join()
 
 
 def request(cmd):
@@ -260,7 +324,7 @@ def request(cmd):
 
     print("-->", cmd.strip().decode())
     s.sendall(cmd)
-    r = s.recv(1024)
+    r = s.recv(4196)
     print("<--", r.decode().strip() or '(none)')
 
     s.close()
@@ -315,8 +379,15 @@ if __name__ == '__main__':
         if not started:
             raise error('Failed to start server.')
 
-    _ = request(GET_SSO)
-    print(_)
+    if _ := request(GET_SSO).strip():
+        session = json.loads(_)
+        t = dt.datetime.fromisoformat(session['issuedAt'])
+        print(now() - t)
+        if now() - t > dt.timedelta(seconds=5):
+            ...
+    else:
+        _ = sso_auth()
+        assert request(PUT_SSO + json.dumps(_).encode() + b'\n') == OK
 
     # stop()
 
