@@ -16,7 +16,7 @@ import urllib.error
 import datetime as dt
 from typing import Any, Optional
 
-assert sys.version.startswith('3.9.')
+assert (_ := sys.version_info) > (3, 9), _
 
 HOST = '0.0.0.0'
 PORT = 4550
@@ -441,11 +441,11 @@ def request(data):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.connect((HOST, PORT))
 
-    print("-->", data)
+    # print("-->", data)
     s.sendall(json.dumps(data).encode())
 
     r = s.recv(4196)
-    print("<--", r.decode().strip() or '(none)')
+    # print("<--", r.decode().strip() or '(none)')
 
     s.close()
     return r
@@ -475,9 +475,8 @@ def is_running():
 
 
 if __name__ == '__main__':
-    assert (_ := sys.version_info) > (3, 9), _
-    print('pid', my_pid := os.getpid())
     print('args', args := sys.argv[1:])
+    print('pid', my_pid := os.getpid())
     print('server', get_server())
 
     if args == ['serve']:
@@ -486,13 +485,25 @@ if __name__ == '__main__':
     elif args == ['stop']:
         stop_server() and exit()
 
+    elif '--' not in args:
+        error('-- is missing in args')
+
+    sso_args = []
+    while args:
+        if args[0] == '--':
+            args = args[1:]
+            break
+        else:
+            sso_args.append(args.pop(0))
+
     started = False
     if not is_running():
         start_server()
         time.sleep(0.1)
 
-    if _ := request('ai').strip():
-        print(_)
+    if _ := request(data=sso_args).strip():
+        os.environ.update(json.loads(_))
+        os.system(' '.join(args))
 
     # stop()
 
