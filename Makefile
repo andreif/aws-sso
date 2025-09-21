@@ -9,5 +9,8 @@ run: ${path}
 serve: ${path}
 	aws-sso.py serve
 
+stop: ${path}
+	aws-sso.py stop
+
 ${path}:
 	ln -sf $$(realpath aws-sso.py) ${path}

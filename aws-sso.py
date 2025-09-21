@@ -341,7 +341,7 @@ def verify_client(addr):
 
 
 def wait(seconds):
-    for _ in range(seconds * 10):
+    for _ in range(int(seconds * 10)):
         if not SHUTDOWN.is_set():
             time.sleep(0.1)
 
@@ -438,17 +438,23 @@ def serve():
 
 
 def request(data):
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.connect((HOST, PORT))
+    while True and not SHUTDOWN.is_set():
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect((HOST, PORT))
+        except Exception as e:
+            if 'Connection refused' not in str(e):
+                print(e)
+            wait(0.5)
+        else:
+            # print("-->", data)
+            s.sendall(json.dumps(data).encode())
 
-    # print("-->", data)
-    s.sendall(json.dumps(data).encode())
+            r = s.recv(4196)
+            # print("<--", r.decode().strip() or '(none)')
 
-    r = s.recv(4196)
-    # print("<--", r.decode().strip() or '(none)')
-
-    s.close()
-    return r
+            s.close()
+            return r
 
 
 def start_server():
@@ -467,7 +473,7 @@ def get_server():
 def stop_server():
     if _ := get_server():
         _, = _
-        os.kill(_['pid'], signal.SIGTERM)
+        os.kill(int(_['pid']), signal.SIGTERM)
 
 
 def is_running():
@@ -475,15 +481,17 @@ def is_running():
 
 
 if __name__ == '__main__':
-    print('args', args := sys.argv[1:])
-    print('pid', my_pid := os.getpid())
-    print('server', get_server())
+    args = sys.argv[1:]
+    # print('args', )
+    # print('server', get_server())
 
     if args == ['serve']:
-        serve() and exit()
+        serve()
+        exit()
 
     elif args == ['stop']:
-        stop_server() and exit()
+        stop_server()
+        exit()
 
     elif '--' not in args:
         error('-- is missing in args')
@@ -499,13 +507,27 @@ if __name__ == '__main__':
     started = False
     if not is_running():
         start_server()
-        time.sleep(0.1)
 
     if _ := request(data=sso_args).strip():
         os.environ.update(json.loads(_))
-        os.system(' '.join(args))
-
-    # stop()
+        proc = subprocess.Popen(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env={'PYTHONUNBUFFERED': '1', **os.environ, **json.loads(_)},
+        )
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+        finally:
+            proc.stdout and proc.stdout.close()
+            rc = proc.wait()
+            if rc != 0:
+                raise subprocess.CalledProcessError(rc, args)
 
     # while True:
     #     with pathlib.Path('/tmp/aws-sso.log').open('a+') as fp:
@@ -515,5 +537,3 @@ if __name__ == '__main__':
     # while True:
     #     time.sleep(1)
     #     print(pathlib.Path('/tmp/aws-sso.log').read_text())
-
-    # main()
