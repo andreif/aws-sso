@@ -89,10 +89,10 @@ def get_sso_config(name=None):
     return {'name': name, **session}
 
 
-def get_profile_config(name, require=False):
+def get_profile_config(name, require=False, resolve=True):
     if c := load_aws_config().get('profile', {}).get(name):
-        if i := c.pop('include_profile', None):
-            c = {**get_profile_config(i, require=True), **c}
+        if resolve and (_ := c.pop('include_profile', None)):
+            c = {**get_profile_config(_, require=True), **c}
         return c
     elif require:
         raise error(f'No [profile <name>] found in {AWS_CONFIG_PATH}')
@@ -565,6 +565,7 @@ def main():
         print(' - aws-sso serve               # starts token server')
         print(' - aws-sso stop                # stops the server')
         print(' - aws-sso -l                  # list SSO accounts and roles')
+        print(' - aws-sso -l                  # list profiles from ~/.aws/config')
 
     elif args == ['serve']:
         serve()
@@ -575,6 +576,21 @@ def main():
     elif args == ['-l']:
         if _ := request(data=args).strip():
             print(_.decode())
+
+    elif args == ['-p']:
+        conf = load_aws_config()
+        print('sso-sessions:')
+        for k, v in conf.get('sso-session', {}).items():
+            print(f'  {k}:')
+            for k, v in v.items():
+                print(f'    {k}: {v}')
+        print('profiles:')
+        for _ in sorted(conf.get('profile', {})):
+            print(f'  {_}:')
+            for k, v in get_profile_config(name=_, resolve=False).items():
+                if v.startswith('0'):
+                    v = f'"{v}"'
+                print(f'    {k}: {v}')
 
     elif '--' not in args:
         error('-- is missing in args')

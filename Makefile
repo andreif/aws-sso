@@ -7,6 +7,8 @@ help: ${path}
 	aws-sso.py | yq -P
 list: ${path}
 	aws-sso.py -l | yq -P
+list-profiles: ${path}
+	aws-sso.py -p | yq -P
 run: ${path}
 	aws-sso.py
 
