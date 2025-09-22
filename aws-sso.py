@@ -1,4 +1,5 @@
 #!/usr/bin/python3
+import asyncio
 import re
 import signal
 import sys
@@ -218,23 +219,33 @@ def get_sso_session(create=False):
             update_accounts(session=SSO_SESSION)
             return _
 
-    raise error('Timed out waiting for authorization.')
+    if now() > expires_at:
+        raise error('Timed out waiting for authorization.')
+    else:
+        raise error('Aborted.')
 
 
 def portal(path, token, region, **query):
-    url = PORTAL_URL.format(region) + path
-    if query:
-        url += '?' + urllib.parse.urlencode(query, safe='-_.~')
-    print(url)
-    req = urllib.request.Request(
-        url=url,
-        headers={'Accept': 'application/json', 'x-amz-sso_bearer_token': token},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        return False
+    while not SHUTDOWN.is_set():
+        url = PORTAL_URL.format(region) + path
+        if query:
+            url += '?' + urllib.parse.urlencode(query, safe='-_.~')
+        print(url)
+        req = urllib.request.Request(
+            url=url,
+            headers={'Accept': 'application/json', 'x-amz-sso_bearer_token': token},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                wait(0.1)
+                continue
+            else:
+                print(e)
+                break
+    return False
 
 
 def get_accounts(session=None):
@@ -270,6 +281,30 @@ def get_roles(account_id, session=None):
             roles.append(r['roleName'])
         return roles
     return None
+
+
+async def gather_with_concurrency(n, coroutines):
+    semaphore = asyncio.Semaphore(n)
+
+    async def sem_coro(coroutine):
+        async with semaphore:
+            return await coroutine
+
+    return await asyncio.gather(*(sem_coro(c) for c in coroutines))
+
+
+async def get_roles_async(account_ids, session=None):
+    assert isinstance(account_ids, (list, dict))
+    if not session:
+        session = get_sso_session(create=True)
+    async def task(account_id):
+        try:
+            return account_id, await asyncio.to_thread(get_roles, account_id=account_id, session=session)
+        except Exception as e:
+            print(e)
+            raise
+    tasks = [task(account_id=_) for _ in account_ids]
+    return dict(await gather_with_concurrency(10, tasks))
 
 
 def update_accounts(session):
@@ -410,10 +445,20 @@ def serve():
                         continue
                     else:
                         print(_args)
-                        aliases = {
-                            v: k for k, v in get_sso_session(create=True)['accounts'].items()
-                        }
+                        accounts = get_sso_session(create=True)['accounts']
+                        aliases = {v: k for k, v in accounts.items()}
                         account_id = role_name = duration = region = None
+
+                        if _args == ['-l']:
+                            account_roles = asyncio.run(get_roles_async(account_ids=accounts))
+                            lines = []
+                            for account_id, account_name in sorted(accounts.items(), key=lambda x: x[1]):
+                                if roles := account_roles.get(account_id):
+                                    lines.append(f'{account_id} {account_name}:')
+                                    for _ in roles:
+                                        lines.append(f'  - {_}')
+                            c.sendall('\n'.join(lines).encode())
+                            continue
 
                         if len(_args) == 1 and (p := get_profile_config(_args[0])):
                             print(p)
@@ -519,12 +564,17 @@ def main():
         print(' - aws-sso $POFILE -- aws ...  # uses profile from ~/.aws/config')
         print(' - aws-sso serve               # starts token server')
         print(' - aws-sso stop                # stops the server')
+        print(' - aws-sso -l                  # list SSO accounts and roles')
 
     elif args == ['serve']:
         serve()
 
     elif args == ['stop']:
         stop_server()
+
+    elif args == ['-l']:
+        if _ := request(data=args).strip():
+            print(_.decode())
 
     elif '--' not in args:
         error('-- is missing in args')

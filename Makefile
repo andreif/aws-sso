@@ -3,6 +3,10 @@ path = /usr/local/bin/aws-sso
 clean:
 	rm -f ${path}
 
+help: ${path}
+	aws-sso.py | yq -P
+list: ${path}
+	aws-sso.py -l | yq -P
 run: ${path}
 	aws-sso.py
 
