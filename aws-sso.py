@@ -31,6 +31,8 @@ PORTAL_URL = 'https://portal.sso.{}.amazonaws.com'
 AWS_CONFIG: Optional[configparser.ConfigParser] = None
 AWS_CONFIG_PATH = pathlib.Path.home() / '.aws/config'
 SSO_SESSION: Optional[dict[str, Any]] = None
+AWS_ROLES: Optional[dict[tuple[str, str, str], Any]] = None
+RX_REGION = re.compile(r'(af|ap|ca|cn|eu|il|me|mx|sa|us)-(central|east|north|south|west)-\d')
 
 
 def _shutdown(*_):
@@ -46,47 +48,55 @@ def error(msg: str) -> None:
     sys.exit(1)
 
 
-def load_config() -> configparser.ConfigParser:
+def load_aws_config():
     global AWS_CONFIG
-    if AWS_CONFIG:
-        return AWS_CONFIG
-    elif AWS_CONFIG_PATH.exists():
-        AWS_CONFIG = configparser.ConfigParser()
-        AWS_CONFIG.read(AWS_CONFIG_PATH)
+    if AWS_CONFIG_PATH.exists():
+        c = configparser.ConfigParser()
+        c.read(AWS_CONFIG_PATH)
+
+        data = {}
+        for name, s in c.items():
+            if ' ' in (name := name.strip()):
+                g, name = name.split()
+                _ = data.setdefault(g, {}).setdefault(name, {})
+            else:
+                _ = data.setdefault(name, {})
+            for k, v in s.items():
+                _[k] = v.replace('"', '')
+        with LOCK:
+            AWS_CONFIG = data
         return AWS_CONFIG
     else:
         raise error(f'File not found {AWS_CONFIG_PATH}')
 
 
-def load_sso_config(name=None):
+def get_sso_config(name=None):
     name = name or os.getenv('AWS_SSO_SESSION')
-    config = load_config()
+    config = load_aws_config()
 
-    sessions: list[tuple[str, configparser.SectionProxy]] = [
-        (s[12:].strip(), config[s])  # strip leading 'sso-session '
-        for s in config.sections()
-        if s.startswith('sso-session ')
-    ]
-    if not sessions:
+    if not (sessions := config.get('sso-session')):
         raise error(f'No [sso-session <name>] found in {AWS_CONFIG_PATH}')
 
     if name:
-        for _name, section in sessions:
-            if _name == name:
-                chosen = (name, section)
-                break
-        else:
-            raise error(
-                f'Requested sso-session {name!r} not found. '
-                f'Available: {[n for n, _ in sessions]}'
-            )
+        if not (session := sessions.get(name)):
+            raise error(f'Requested sso-session {name!r} not found. Available: {sessions}')
     else:
-        chosen = sessions[0]
+        name, session = list(sessions.items())[0]
         if len(sessions) > 1:
-            print(f'Warning: multiple sso-sessions found, selecting {chosen[0]}')
+            print(f'Warning: multiple sso-sessions found, selecting {name!r} {session}')
 
-    name, section = chosen
-    return {'name': name, **section}
+    return {'name': name, **session}
+
+
+def get_profile_config(name, require=False):
+    if c := load_aws_config().get('profile', {}).get(name):
+        if i := c.pop('include_profile', None):
+            c = {**get_profile_config(i, require=True), **c}
+        return c
+    elif require:
+        raise error(f'No [profile <name>] found in {AWS_CONFIG_PATH}')
+    else:
+        return None
 
 
 def post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -130,17 +140,19 @@ def get_sso_session(create=False):
             print('Session refreshed', _)
             return SSO_SESSION
         else:
-            print('Session still valid, remaining', int((x - d).total_seconds()))
+            print('Session still valid for', int((x - d).total_seconds()), 'seconds')
             if update_accounts(session=SSO_SESSION):
                 return SSO_SESSION
             else:
+                print('Session signed out externally')
                 with LOCK:
                     SSO_SESSION = None
     if not create:
+        print('No active sso-session, not creating new one')
         return None
 
-    print('New session')
-    _ = load_sso_config()
+    print('Creating a new session')
+    _ = get_sso_config()
     start_url = _['sso_start_url']
     region = _['sso_region']
     scopes: list[str] = _['sso_registration_scopes'].split()
@@ -280,9 +292,9 @@ def get_role_session(account_id, role_name):
             rc = data.get('roleCredentials') or {}
             if not rc:
                 raise RuntimeError("No roleCredentials in response")
-            # def _utc_iso(ms_since_epoch: int) -> str:
-            #     # AWS returns expiration in ms since epoch
-            #     return dt.datetime.fromtimestamp(ms_since_epoch / 1000, tz=dt.UTC).isoformat()
+            exp = dt.datetime.fromtimestamp(rc['expiration'] / 1000, tz=dt.timezone.utc)
+            print(exp)
+            print(exp - now())
             return {
                 'AWS_ACCESS_KEY_ID': rc['accessKeyId'],
                 'AWS_SECRET_ACCESS_KEY': rc['secretAccessKey'],
@@ -401,23 +413,38 @@ def serve():
                         aliases = {
                             v: k for k, v in get_sso_session(create=True)['accounts'].items()
                         }
-                        account_id = role_name = duration = None
-                        for a in _args:
-                            if a.isdigit():
-                                if len(a) == 12:
-                                    account_id = a
-                                else:
-                                    duration = a
-                            elif '-' in a:
-                                if _ := aliases.get(a):
-                                    account_id = _
-                                else:
-                                    c.sendall(f"No access to account {a}, accessible: {aliases}".encode())
-                                    break
+                        account_id = role_name = duration = region = None
+
+                        if len(_args) == 1 and (p := get_profile_config(_args[0])):
+                            print(p)
+                            if _ := p.get('sso_account_id'):
+                                account_id = _
+                                role_name = p['sso_role_name']
+                                region = p.get('region')
+                                duration = p.get('duration_seconds')
+                            elif _ := p.get('source_profile'):
+                                raise NotImplementedError
                             else:
-                                role_name = a
+                                c.sendall(f"Invalid profile: {_args[0]} {p}".encode())
+                        else:
+                            for a in _args:
+                                if a.isdigit():
+                                    if len(a) == 12:
+                                        account_id = a
+                                    else:
+                                        duration = a
+                                elif '-' in a:
+                                    if RX_REGION.match(a):
+                                        region = a
+                                    elif _ := aliases.get(a):
+                                        account_id = _
+                                    else:
+                                        # TODO: profile, chaining
+                                        c.sendall(f"No access to account {a}, accessible: {aliases}".encode())
+                                        break
+                                else:
+                                    role_name = a
                         if not account_id:
-                            ...  # TODO: role name is profile
                             c.sendall("Account ID, or name, or profile name are missing".encode())
                             continue
                         role_name = {
@@ -480,54 +507,64 @@ def is_running():
     return bool(get_server())
 
 
-if __name__ == '__main__':
+def main():
     args = sys.argv[1:]
-    # print('args', )
-    # print('server', get_server())
+    print('args', args, file=sys.stderr)
+    print('server', get_server(), file=sys.stderr)
 
-    if args == ['serve']:
+    if not args:
+        print('Example usage:')
+        print(' - aws-sso $ACCOUNT_NAME [$ROLE_NAME] [$REGION] -- aws s3 ls')
+        print(' - aws-sso $ACCOUNT_ID -- aws sts get-caller-identity # uses read-only role by default')
+        print(' - aws-sso $POFILE -- aws ...  # uses profile from ~/.aws/config')
+        print(' - aws-sso serve               # starts token server')
+        print(' - aws-sso stop                # stops the server')
+
+    elif args == ['serve']:
         serve()
-        exit()
 
     elif args == ['stop']:
         stop_server()
-        exit()
 
     elif '--' not in args:
         error('-- is missing in args')
 
-    sso_args = []
-    while args:
-        if args[0] == '--':
-            args = args[1:]
-            break
-        else:
-            sso_args.append(args.pop(0))
+    else:
+        sso_args = []
+        while args:
+            if args[0] == '--':
+                args = args[1:]
+                break
+            else:
+                sso_args.append(args.pop(0))
 
-    started = False
-    if not is_running():
-        start_server()
+        if not is_running():
+            start_server()
 
-    if _ := request(data=sso_args).strip():
-        os.environ.update(json.loads(_))
-        proc = subprocess.Popen(
-            args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            env={'PYTHONUNBUFFERED': '1', **os.environ, **json.loads(_)},
-        )
-        try:
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                sys.stdout.write(line)
-                sys.stdout.flush()
-        finally:
-            proc.stdout and proc.stdout.close()
-            rc = proc.wait()
-            if rc != 0:
-                raise subprocess.CalledProcessError(rc, args)
+        if _ := request(data=sso_args).strip():
+            os.environ.update(json.loads(_))
+            proc = subprocess.Popen(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env={'PYTHONUNBUFFERED': '1', **os.environ, **json.loads(_)},
+            )
+            try:
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+            finally:
+                proc.stdout and proc.stdout.close()
+                rc = proc.wait()
+                if rc != 0:
+                    raise subprocess.CalledProcessError(rc, args)
+
+
+if __name__ == '__main__':
+    main()
 
     # while True:
     #     with pathlib.Path('/tmp/aws-sso.log').open('a+') as fp:
