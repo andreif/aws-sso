@@ -11,6 +11,8 @@ list-profiles: ${path}
 	aws-sso.py -p | yq -P
 run: ${path}
 	aws-sso.py
+run-yq: ${path}
+	aws-sso.py | yq -P
 
 serve: ${path}
 	aws-sso.py serve

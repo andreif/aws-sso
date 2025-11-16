@@ -33,7 +33,10 @@ AWS_CONFIG: Optional[configparser.ConfigParser] = None
 AWS_CONFIG_PATH = pathlib.Path.home() / '.aws/config'
 SSO_SESSION: Optional[dict[str, Any]] = None
 AWS_ROLES: Optional[dict[tuple[str, str, str], Any]] = None
-RX_REGION = re.compile(r'(af|ap|ca|cn|eu|il|me|mx|sa|us)-(central|east|north|south|west)-\d')
+
+
+class RX:
+    REGION = re.compile(r'(af|ap|ca|cn|eu|il|me|mx|sa|us)-(central|east|north|south|west)-\d')
 
 
 def _shutdown(*_):
@@ -315,7 +318,7 @@ def update_accounts(session):
     return False
 
 
-def get_role_session(account_id, role_name):
+def get_role_session(account_id, role_name, region=None):
     if session := get_sso_session(create=True):
         if data := portal(
             path='/federation/credentials',
@@ -335,6 +338,8 @@ def get_role_session(account_id, role_name):
                 'AWS_SECRET_ACCESS_KEY': rc['secretAccessKey'],
                 'AWS_SESSION_TOKEN': rc['sessionToken'],
                 # 'AWS_CREDENTIAL_EXPIRATION': _utc_iso(rc['expiration']),
+                'AWS_REGION': region or '',
+                'AWS_DEFAULT_REGION': region or '',
             }
     return None
 
@@ -479,7 +484,7 @@ def serve():
                                     else:
                                         duration = a
                                 elif '-' in a:
-                                    if RX_REGION.match(a):
+                                    if RX.REGION.match(a):
                                         region = a
                                     elif _ := aliases.get(a):
                                         account_id = _
@@ -502,7 +507,7 @@ def serve():
                         if role_name not in roles:
                             c.sendall(f"Invalid role name {role_name}, allowed: {roles}".encode())
                         else:
-                            _ = get_role_session(account_id=account_id, role_name=role_name)
+                            _ = get_role_session(account_id=account_id, role_name=role_name, region=region)
                             c.sendall(json.dumps(_).encode())
     finally:
         SHUTDOWN.set()
@@ -567,7 +572,7 @@ def main():
         print(' - aws-sso -l                  # list SSO accounts and roles')
         print(' - aws-sso -l                  # list profiles from ~/.aws/config')
 
-    elif args == ['serve']:
+    elif args in (['serve'], ['start']):
         serve()
 
     elif args == ['stop']:
@@ -593,7 +598,7 @@ def main():
                 print(f'    {k}: {v}')
 
     elif '--' not in args:
-        error('-- is missing in args')
+        raise error('-- is missing in args')
 
     else:
         sso_args = []
@@ -601,32 +606,24 @@ def main():
             if args[0] == '--':
                 args = args[1:]
                 break
-            else:
-                sso_args.append(args.pop(0))
+            elif (_ := args.pop(0)) != 'exec':
+                sso_args.append(_)
 
         if not is_running():
             start_server()
 
         if _ := request(data=sso_args).strip():
+            if _[:1] != b'{':
+                raise error(_.decode())
             os.environ.update(json.loads(_))
             proc = subprocess.Popen(
                 args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                env={'PYTHONUNBUFFERED': '1', **os.environ, **json.loads(_)},
+                env={'PYTHONUNBUFFERED': '1', 'FORCE_COLOR': '1', **os.environ, **json.loads(_)},
             )
-            try:
-                assert proc.stdout is not None
-                for line in proc.stdout:
-                    sys.stdout.write(line)
-                    sys.stdout.flush()
-            finally:
-                proc.stdout and proc.stdout.close()
-                rc = proc.wait()
-                if rc != 0:
-                    raise subprocess.CalledProcessError(rc, args)
+            proc.wait()
+
+
+__all__ = ['RX']
 
 
 if __name__ == '__main__':
