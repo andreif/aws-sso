@@ -465,12 +465,18 @@ def serve():
                             c.sendall('\n'.join(lines).encode())
                             continue
 
+                        if '--region' in _args:
+                            # TODO: use argparse for aws-vault args?
+                            assert _args.index('--region') == 1 and len(_args) == 3, _args
+                            region = _args[2]
+                            _args = _args[:1]
+
                         if len(_args) == 1 and (p := get_profile_config(_args[0])):
                             print(p)
                             if _ := p.get('sso_account_id'):
                                 account_id = _
                                 role_name = p['sso_role_name']
-                                region = p.get('region')
+                                region = region or p.get('region')
                                 duration = p.get('duration_seconds')
                             elif _ := p.get('source_profile'):
                                 raise NotImplementedError
